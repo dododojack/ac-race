@@ -1,5 +1,6 @@
 -- CSP online script: Ctrl+M race menu + HUD. Talks to ac_plugin.py through hidden "ACR|" chat lines.
 local visible, tab = false, 'practice'
+local gotHello = false
 local state = {
   routes = {}, route = nil, laps = 1, admin = false, roster = {}, invite = nil,
   lobby = nil, ready = false, hud = nil, result = nil, msg = nil, msgAt = 0, go = nil, gate = nil,
@@ -25,10 +26,9 @@ end
 
 local function flash(text, color) state.msg, state.msgColor, state.msgAt = text, color or C.dim, os.clock() end
 
-ac.onChatMessage(function(message, senderCarIndex)
+local function handle(message)
   local at = message:find('ACR|', 1, true)
   if not at then return false end
-  state.lastRaw = message
   local f = split(message:sub(at + 4), '|')
   local kind = f[1]
   gotHello = true
@@ -72,11 +72,31 @@ ac.onChatMessage(function(message, senderCarIndex)
   elseif kind == 'declined' then flash((f[2] or '') .. ' 拒絕了邀請', C.bad)
   elseif kind == 'invite_expired' then flash('邀請已逾時', C.dim)
   end
-  return true -- hide protocol lines from chat
-end)
+  return true
+end
 
-local helloTimer, gotHello, speedTimer, comboHeld = 3, false, 0, false
+-- channel 1: chat (hidden); channel 2: HTTP mailbox on the server (port 8766)
+ac.onChatMessage(function(message) return handle(message) end)
+
+local pollTimer, polling = 0, false
+local function poll(dt)
+  pollTimer = pollTimer + dt
+  if polling or pollTimer < 1 then return end
+  pollTimer, polling = 0, true
+  local car = ac.getCar(0)
+  local url = string.format('http://%s:8766/acr/%d', ac.getServerIP(), car.sessionID)
+  web.get(url, function(err, response)
+    polling = false
+    state.pollError = err and tostring(err) or nil
+    if response and response.body then
+      for line in response.body:gmatch('[^\n]+') do handle(line) end
+    end
+  end)
+end
+
+local helloTimer, speedTimer, comboHeld = 3, 0, false
 function script.update(dt)
+  poll(dt)
   -- keep greeting the server until it answers (first messages can be lost while joining)
   if not gotHello then
     helloTimer = helloTimer + dt
@@ -98,14 +118,15 @@ function script.update(dt)
 end
 
 -- widgets ---------------------------------------------------------------
-local function header(text)
-  ui.pushFont(ui.Font.Huge)
-  ui.textColored(text, C.accent)
-  ui.popFont()
-  ui.offsetCursorY(2)
+local FONT = 'Microsoft JhengHei UI'
+local function dtext(text, size, color)
+  ui.pushDWriteFont(FONT)
+  ui.dwriteText(text, size or 18, color or rgbm.colors.white)
+  ui.popDWriteFont()
 end
 
-local function label(text) ui.textColored(text, C.dim) end
+local function header(text) dtext(text, 24, C.accent); ui.offsetCursorY(2) end
+local function label(text) dtext(text, 17, C.dim) end
 
 local function bigButton(text, color)
   if color then ui.pushStyleColor(ui.StyleColor.Button, color) end
@@ -117,7 +138,7 @@ end
 local function routePicker()
   label('路線')
   if #state.routes == 0 then
-    ui.textColored('尚未設定路線', C.bad)
+    dtext('尚未設定路線', 18, C.bad)
     if state.admin then label('到「管理」分頁設定起點與終點') else label('請管理員設定路線') end
     return false
   end
@@ -139,12 +160,12 @@ local function lobbyPanel()
   label('場次 ' .. state.lobby.id .. '  ·  ' .. state.lobby.laps .. ' 圈')
   if state.gate and car then
     local d = vec2(car.position.x, car.position.z):distance(state.gate)
-    ui.text(string.format('距起點 %.0f m', d))
+    dtext(string.format('距起點 %.0f m', d))
     label('飛馳起跑：沿正確方向通過起點線即開始計時')
   end
   if not state.ready then
     if bigButton('準備好了', rgbm(0.15, 0.45, 0.25, 1)) then send('ready'); state.ready = true end
-  else ui.textColored('已準備，等待對手…', C.ok) end
+  else dtext('已準備，等待對手…', 18, C.ok) end
   if ui.button('取消', vec2(ui.availableSpaceX(), 24)) then send('cancel'); state.lobby = nil end
 end
 
@@ -160,7 +181,7 @@ local function duelTab()
   local inv = state.invite
   if inv and os.clock() < inv.expires then
     header('收到挑戰')
-    ui.text(string.format('%s 邀請你跑 %s', inv.name, inv.route))
+    dtext(string.format('%s 邀請你跑 %s', inv.name, inv.route))
     label(string.format('剩 %.0f 秒', inv.expires - os.clock()))
     ui.columns(2, false)
     if bigButton('接受', rgbm(0.15, 0.45, 0.25, 1)) then send('accept'); state.invite = nil end
@@ -177,9 +198,9 @@ local function duelTab()
   if #state.roster == 0 then label('目前沒有其他車手') end
   for _, p in ipairs(state.roster) do
     local racing = p.status == 'racing'
-    ui.text(p.name)
+    dtext(p.name)
     ui.sameLine(ui.windowWidth() - 160)
-    if racing then ui.textColored('比賽中', C.dim)
+    if racing then dtext('比賽中', 18, C.dim)
     elseif ui.button('邀請##' .. p.slot, vec2(80, 0)) then
       send('invite', p.slot, state.route, math.floor(state.laps))
       flash('已邀請 ' .. p.name, C.ok)
@@ -191,7 +212,7 @@ local function recordsTab()
   local r = state.result
   if r then
     header(r.won and '勝利！' or (r.status == 'finished' and '完賽' or '未完賽'))
-    ui.text('最快圈  ' .. r.best .. ' s')
+    dtext('最快圈  ' .. r.best .. ' s')
     label('賽事編號 ' .. r.id)
     ui.columns(2, false)
     if bigButton('再跑一次') then send('practice') end
@@ -203,9 +224,9 @@ local function recordsTab()
   local rec = state.records
   if not rec then label('載入中…'); return end
   header('我的紀錄')
-  ui.text(string.format('出賽 %s 場  ·  有效完賽 %s 場', rec.runs, rec.done))
+  dtext(string.format('出賽 %s 場  ·  有效完賽 %s 場', rec.runs, rec.done))
   for _, row in ipairs(rec.best) do
-    ui.text(row[1]); ui.sameLine(ui.windowWidth() - 160); ui.textColored(row[2] .. ' s', C.accent)
+    dtext(row[1]); ui.sameLine(ui.windowWidth() - 160); dtext(row[2] .. ' s', 18, C.accent)
   end
 end
 
@@ -216,9 +237,9 @@ local function boardTab()
   header('排行榜  ' .. (state.route or ''))
   if #state.board == 0 then label('還沒有有效成績') end
   for i, row in ipairs(state.board) do
-    ui.textColored(string.format('%d', i), i == 1 and C.accent or C.dim)
-    ui.sameLine(30); ui.text(row[1] or '')
-    ui.sameLine(ui.windowWidth() - 160); ui.text((row[2] or '') .. ' s')
+    dtext(string.format('%d', i), 18, i == 1 and C.accent or C.dim)
+    ui.sameLine(30); dtext(row[1] or '')
+    ui.sameLine(ui.windowWidth() - 160); dtext((row[2] or '') .. ' s')
   end
 end
 
@@ -258,9 +279,7 @@ function script.drawUI()
   local screen = ui.windowSize()
   if os.clock() - loadedAt < 12 then
     ui.toolWindow('ACR_LOADED', vec2(screen.x / 2 - 210, 90), vec2(420, 44), true, false, function()
-      ui.pushFont(ui.Font.Title)
-      ui.textColored('比賽選單已載入 · 按 Ctrl+M 開啟', C.accent)
-      ui.popFont()
+      dtext('比賽選單已載入 · 按 Ctrl+M 開啟', 20, C.accent)
     end)
   end
 
@@ -269,16 +288,16 @@ function script.drawUI()
       ui.drawRectFilled(vec2(0, 0), vec2(300, 78), C.panel, 6)
       ui.pushFont(ui.Font.Huge)
       local t = state.hud.time
-      ui.textColored(string.format('%d:%06.3f', math.floor(t / 60), t % 60), C.accent)
+      dtext(string.format('%d:%06.3f', math.floor(t / 60), t % 60), 40, C.accent)
       ui.popFont()
-      ui.text(string.format('圈 %s  ·  分段 %s  ·  %.0f km/h', state.hud.laps, state.hud.sector, ac.getCar(0).speedKmh))
+      dtext(string.format('圈 %s  ·  分段 %s  ·  %.0f km/h', state.hud.laps, state.hud.sector, ac.getCar(0).speedKmh))
     end)
   end
 
   if state.go and os.clock() < state.go then
     ui.toolWindow('ACR_GO', vec2(screen.x / 2 - 60, screen.y / 3), vec2(120, 90), true, false, function()
       ui.pushFont(ui.Font.Huge)
-      ui.textColored(string.format('%d', math.ceil(state.go - os.clock())), C.accent)
+      dtext(string.format('%d', math.ceil(state.go - os.clock())), 64, C.accent)
       ui.popFont()
     end)
   end
@@ -288,9 +307,7 @@ function script.drawUI()
     ui.drawRectFilled(vec2(0, 0), vec2(W, H), C.panel, 8)
     ui.drawRectFilled(vec2(0, 0), vec2(W, 3), C.line)
     ui.offsetCursorY(6)
-    ui.pushFont(ui.Font.Huge)
-    ui.textColored('玉長賽事', C.accent)
-    ui.popFont()
+    dtext('玉長賽事', 30, C.accent)
     ui.sameLine(W - 150)
     label('Ctrl+M 關閉')
     ui.pushFont(ui.Font.Title)
@@ -302,7 +319,7 @@ function script.drawUI()
     ui.popFont()
     if not gotHello then
       ui.separator()
-      ui.textColored('等待伺服器回應…（若一直出現，請截圖給管理員）', C.bad)
+      dtext('等待伺服器回應…' .. (state.pollError and ('  ' .. state.pollError) or ''), 16, C.bad)
     end
     if state.msg and os.clock() - state.msgAt < 6 then
       ui.separator()
