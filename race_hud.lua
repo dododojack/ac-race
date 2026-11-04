@@ -29,6 +29,7 @@ ac.onChatMessage(function(message)
   if message:sub(1, 4) ~= 'ACR|' then return false end
   local f = split(message:sub(5), '|')
   local kind = f[1]
+  gotHello = true
   if kind == 'routes' then
     state.routes = split(f[2], ',')
     state.route = state.route or state.routes[1]
@@ -72,9 +73,13 @@ ac.onChatMessage(function(message)
   return true -- hide protocol lines from chat
 end)
 
-local hello, speedTimer, comboHeld = false, 0, false
+local helloTimer, gotHello, speedTimer, comboHeld = 3, false, 0, false
 function script.update(dt)
-  if not hello then send('hello'); hello = true end
+  -- keep greeting the server until it answers (first messages can be lost while joining)
+  if not gotHello then
+    helloTimer = helloTimer + dt
+    if helloTimer > 4 then helloTimer = 0; send('hello') end
+  end
   local ctrl, m = ac.isKeyDown(ac.KeyIndex.Control), ac.isKeyDown(ac.KeyIndex.M)
   if ctrl and m and not comboHeld then
     visible = not visible
@@ -250,13 +255,13 @@ local loadedAt = os.clock()
 function script.drawUI()
   local screen = ui.windowSize()
   if os.clock() - loadedAt < 12 then
-    ui.toolWindow('ACR_LOADED', vec2(screen.x / 2 - 150, 90), vec2(300, 34), false, function()
+    ui.toolWindow('ACR_LOADED', vec2(screen.x / 2 - 150, 90), vec2(300, 34), true, false, function()
       ui.textColored('比賽選單已載入 · 按 Ctrl+M 開啟', C.accent)
     end)
   end
 
   if state.hud then
-    ui.toolWindow('ACR_HUD', vec2(screen.x / 2 - 150, 24), vec2(300, 78), false, function()
+    ui.toolWindow('ACR_HUD', vec2(screen.x / 2 - 150, 24), vec2(300, 78), true, false, function()
       ui.drawRectFilled(vec2(0, 0), vec2(300, 78), C.panel, 6)
       ui.pushFont(ui.Font.Huge)
       local t = state.hud.time
@@ -267,7 +272,7 @@ function script.drawUI()
   end
 
   if state.go and os.clock() < state.go then
-    ui.toolWindow('ACR_GO', vec2(screen.x / 2 - 60, screen.y / 3), vec2(120, 90), false, function()
+    ui.toolWindow('ACR_GO', vec2(screen.x / 2 - 60, screen.y / 3), vec2(120, 90), true, false, function()
       ui.pushFont(ui.Font.Huge)
       ui.textColored(string.format('%d', math.ceil(state.go - os.clock())), C.accent)
       ui.popFont()
@@ -275,7 +280,7 @@ function script.drawUI()
   end
 
   if not visible then return end
-  ui.toolWindow('ACR_MENU', vec2(40, screen.y / 2 - H / 2), vec2(W, H), true, function()
+  ui.toolWindow('ACR_MENU', vec2(40, screen.y / 2 - H / 2), vec2(W, H), false, true, function()
     ui.drawRectFilled(vec2(0, 0), vec2(W, H), C.panel, 8)
     ui.drawRectFilled(vec2(0, 0), vec2(W, 3), C.line)
     ui.offsetCursorY(6)
