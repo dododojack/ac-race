@@ -1,6 +1,5 @@
--- CSP online script: F8 menu + race HUD. Talks to ac_plugin.py through hidden "ACR|" chat lines.
+-- CSP online script: Ctrl+M menu + race HUD. Talks to ac_plugin.py through hidden "ACR|" chat lines.
 -- Delivered via csp_online_hud.ini; players with a compatible CSP get it automatically on join.
-local KEY = ui.Key.F8
 local visible, tab = false, 'practice'
 local state = {
   routes = {}, route = nil, laps = 1, admin = false, roster = {}, invite = nil,
@@ -63,7 +62,12 @@ function script.update(dt)
       send('spd', string.format('%.1f', ac.getCar(0).speedKmh))
     end
   end
-  if ui.keyPressed(KEY) then
+  local ctrl = ac.isKeyDown(ac.KeyIndex.Control)
+  local m = ac.isKeyDown(ac.KeyIndex.M)
+  if ctrl and m and not state.comboHeld then state.toggle = true end
+  state.comboHeld = ctrl and m
+  if state.toggle then
+    state.toggle = false
     visible = not visible
     if visible then send('roster') end
   end
@@ -140,7 +144,13 @@ local tabs = {
   end,
 }
 
+local loadedAt = os.clock()
 function script.drawUI()
+  if os.clock() - loadedAt < 20 then
+    ui.toolWindow('ACR_LOADED', vec2(24, 60), vec2(300, 40), false, function()
+      ui.text('比賽選單已載入：按 Ctrl+M 開啟')
+    end)
+  end
   if state.hud then
     ui.toolWindow('ACR_HUD', vec2(24, 80), vec2(260, 90), false, function()
       ui.text(string.format('計時 %s s   圈 %s   分段 %s', state.hud.time, state.hud.laps, state.hud.sector))
@@ -166,6 +176,6 @@ function script.drawUI()
     tabs[tab]()
     lobbyPanel()
     if state.msg ~= '' then ui.separator(); ui.text(state.msg) end
-    ui.text('F8 開關選單')
+    ui.text('Ctrl+M 開關選單')
   end)
 end
