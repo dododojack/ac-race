@@ -12,7 +12,7 @@ local C = {
   accent = rgbm(1, 0.62, 0.15, 1), dim = rgbm(1, 1, 1, 0.55), ok = rgbm(0.35, 0.9, 0.5, 1),
   bad = rgbm(1, 0.4, 0.35, 1), panel = rgbm(0.06, 0.07, 0.09, 0.92), line = rgbm(1, 0.62, 0.15, 0.8),
 }
-local W, H = 420, 430
+local W, H = 600, 620
 
 local function send(...) ac.sendChatMessage('ACR|' .. table.concat({ ... }, '|')) end
 
@@ -25,9 +25,11 @@ end
 
 local function flash(text, color) state.msg, state.msgColor, state.msgAt = text, color or C.dim, os.clock() end
 
-ac.onChatMessage(function(message)
-  if message:sub(1, 4) ~= 'ACR|' then return false end
-  local f = split(message:sub(5), '|')
+ac.onChatMessage(function(message, senderCarIndex)
+  local at = message:find('ACR|', 1, true)
+  if not at then return false end
+  state.lastRaw = message
+  local f = split(message:sub(at + 4), '|')
   local kind = f[1]
   gotHello = true
   if kind == 'routes' then
@@ -97,7 +99,7 @@ end
 
 -- widgets ---------------------------------------------------------------
 local function header(text)
-  ui.pushFont(ui.Font.Title)
+  ui.pushFont(ui.Font.Huge)
   ui.textColored(text, C.accent)
   ui.popFont()
   ui.offsetCursorY(2)
@@ -107,7 +109,7 @@ local function label(text) ui.textColored(text, C.dim) end
 
 local function bigButton(text, color)
   if color then ui.pushStyleColor(ui.StyleColor.Button, color) end
-  local clicked = ui.button(text, vec2(ui.availableSpaceX(), 34))
+  local clicked = ui.button(text, vec2(ui.availableSpaceX(), 48))
   if color then ui.popStyleColor() end
   return clicked
 end
@@ -176,7 +178,7 @@ local function duelTab()
   for _, p in ipairs(state.roster) do
     local racing = p.status == 'racing'
     ui.text(p.name)
-    ui.sameLine(ui.windowWidth() - 110)
+    ui.sameLine(ui.windowWidth() - 160)
     if racing then ui.textColored('比賽中', C.dim)
     elseif ui.button('邀請##' .. p.slot, vec2(80, 0)) then
       send('invite', p.slot, state.route, math.floor(state.laps))
@@ -203,7 +205,7 @@ local function recordsTab()
   header('我的紀錄')
   ui.text(string.format('出賽 %s 場  ·  有效完賽 %s 場', rec.runs, rec.done))
   for _, row in ipairs(rec.best) do
-    ui.text(row[1]); ui.sameLine(ui.windowWidth() - 110); ui.textColored(row[2] .. ' s', C.accent)
+    ui.text(row[1]); ui.sameLine(ui.windowWidth() - 160); ui.textColored(row[2] .. ' s', C.accent)
   end
 end
 
@@ -216,7 +218,7 @@ local function boardTab()
   for i, row in ipairs(state.board) do
     ui.textColored(string.format('%d', i), i == 1 and C.accent or C.dim)
     ui.sameLine(30); ui.text(row[1] or '')
-    ui.sameLine(ui.windowWidth() - 110); ui.text((row[2] or '') .. ' s')
+    ui.sameLine(ui.windowWidth() - 160); ui.text((row[2] or '') .. ' s')
   end
 end
 
@@ -255,8 +257,10 @@ local loadedAt = os.clock()
 function script.drawUI()
   local screen = ui.windowSize()
   if os.clock() - loadedAt < 12 then
-    ui.toolWindow('ACR_LOADED', vec2(screen.x / 2 - 150, 90), vec2(300, 34), true, false, function()
+    ui.toolWindow('ACR_LOADED', vec2(screen.x / 2 - 210, 90), vec2(420, 44), true, false, function()
+      ui.pushFont(ui.Font.Title)
       ui.textColored('比賽選單已載入 · 按 Ctrl+M 開啟', C.accent)
+      ui.popFont()
     end)
   end
 
@@ -284,16 +288,22 @@ function script.drawUI()
     ui.drawRectFilled(vec2(0, 0), vec2(W, H), C.panel, 8)
     ui.drawRectFilled(vec2(0, 0), vec2(W, 3), C.line)
     ui.offsetCursorY(6)
-    ui.pushFont(ui.Font.Title)
+    ui.pushFont(ui.Font.Huge)
     ui.textColored('玉長賽事', C.accent)
     ui.popFont()
-    ui.sameLine(W - 90)
+    ui.sameLine(W - 150)
     label('Ctrl+M 關閉')
+    ui.pushFont(ui.Font.Title)
     ui.tabBar('acr_tabs', function()
       for _, t in ipairs(tabs) do ui.tabItem(t[2], function() tab = t[1]; t[3]() end) end
       if state.admin then ui.tabItem('管理', function() tab = 'admin'; adminTab() end) end
     end)
     lobbyPanel()
+    ui.popFont()
+    if not gotHello then
+      ui.separator()
+      ui.textColored('等待伺服器回應…（若一直出現，請截圖給管理員）', C.bad)
+    end
     if state.msg and os.clock() - state.msgAt < 6 then
       ui.separator()
       ui.textColored(state.msg, state.msgColor)
