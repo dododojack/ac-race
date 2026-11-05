@@ -2,7 +2,7 @@
 -- Layout rule: everything flows top-to-bottom (no absolute positioning), so nothing can overlap.
 -- Requests: hidden "ACR|" chat lines. Replies: server HTTP mailbox (port 8766) + chat fallback.
 local REPLAY_PORT, MAILBOX_PORT = 8765, 8766
-local W, H, NAV_W = 660, 600, 150
+local W, H, NAV_W = 780, 720, 176
 
 -- state -----------------------------------------------------------------------
 local visible, page = false, 'practice'
@@ -12,7 +12,7 @@ local S = {
   lobby = nil, ready = false, hud = nil, result = nil, stats = nil, series = nil, go = nil, gate = nil,
   records = nil, board = {}, boardKey = nil, boardClass = '', classes = {}, weekly = nil,
   lobbies = {}, duelMode = 'duel', split = nil, msg = nil, msgColor = nil, msgUntil = 0,
-  pollError = nil, routeName = 'east-full', wrongWay = 0,
+  pollError = nil, routeName = 'east-full', wrongWay = 0, routeInfo = {},
 }
 local A = { invite_seconds = '30', countdown_seconds = '5', limit_seconds = '900', time = '18:30', raceId = '' }
 
@@ -33,7 +33,19 @@ local function pushVar(name, value)
 end
 
 -- protocol ----------------------------------------------------------------------
-local function send(...) ac.sendChatMessage('ACR|' .. table.concat({ ... }, '|')) end
+-- outgoing commands are queued and sent one by one: the game drops chat lines sent in the same instant
+local outbox, outboxTimer = {}, 0
+local function send(...)
+  local line = 'ACR|' .. table.concat({ ... }, '|')
+  if outbox[#outbox] ~= line then outbox[#outbox + 1] = line end
+  while #outbox > 25 do table.remove(outbox, 1) end
+end
+local function flushOutbox(dt)
+  outboxTimer = outboxTimer - dt
+  if outboxTimer > 0 or #outbox == 0 then return end
+  ac.sendChatMessage(table.remove(outbox, 1))
+  outboxTimer = 0.35
+end
 
 local function split(s, sep)
   local out = {}
@@ -47,9 +59,25 @@ local function flash(text, color) S.msg, S.msgColor, S.msgUntil = text, color or
 local handlers = {}
 handlers.routes = function(f)
   S.routes = split(f[2], ',')
+  S.gates = {}
   local found = false
   for _, r in ipairs(S.routes) do if r == S.route then found = true end end
   if not found then S.route = S.routes[1] end
+end
+handlers.routeinfo = function(f)
+  local pts = {}
+  for _, p in ipairs(split(f[3], ';')) do
+    local xy = split(p, ',')
+    if #xy == 2 then pts[#pts + 1] = vec2(tonumber(xy[1]), tonumber(xy[2])) end
+  end
+  S.routeInfo[f[2]] = pts
+end
+handlers.gateinfo = function(f)
+  local name, kind = f[2], f[3]
+  local g = { kind = kind, a = vec2(tonumber(f[4]), tonumber(f[5])), b = vec2(tonumber(f[6]), tonumber(f[7])) }
+  S.gates = S.gates or {}
+  if kind == 's' or not S.gates[name] then S.gates[name] = {} end
+  table.insert(S.gates[name], g)
 end
 handlers.locked = function(f) S.locked = {}; for _, r in ipairs(split(f[2], ',')) do S.locked[r] = true end end
 handlers.admin = function(f) S.admin = f[2] == '1' end
@@ -64,9 +92,25 @@ handlers.invited = function(f)
   S.invite = { slot = f[2], name = f[3], route = f[4], expires = clock + (tonumber(f[5]) or 30) }
   visible, page = true, 'duel'
 end
+local function teleport(x, z, nx, nz)
+  local car = ac.getCar(0)
+  local ok, err = pcall(function()
+    local y = car.position.y
+    local hit = physics.raycastTrack(vec3(x, y + 400, z), vec3(0, -1, 0), 1200)
+    if hit and hit > 0 then y = y + 400 - hit + 0.6 end
+    physics.setCarPosition(0, vec3(x, y, z), vec3(nx, 0, nz))
+  end)
+  if ok then flash('已傳送到起點後方', C.ok)
+  else flash('無法自動傳送（伺服器限制），請用傳送插件或開到起點', C.dim) end
+end
+
 handlers.lobby = function(f)
-  S.lobby = { id = f[2], route = f[3], laps = f[4] }
+  S.lastRoute = f[3]
+  S.lobby = { id = f[2], route = f[3], laps = f[4], solo = f[13] == '1' }
   S.gate = vec2((tonumber(f[5]) + tonumber(f[7])) / 2, (tonumber(f[6]) + tonumber(f[8])) / 2)
+  S.gateDir = f[11] and vec2(tonumber(f[11]), tonumber(f[12])) or nil
+  if f[9] and tonumber(f[9]) then teleport(tonumber(f[9]), tonumber(f[10]), tonumber(f[11]), tonumber(f[12])) end
+  visible = false
   S.ready, S.hud, S.stats, S.split = false, nil, nil, nil
   if page ~= 'duel' then page = 'practice' end
 end
@@ -81,7 +125,7 @@ handlers.stats = function(f)
 end
 handlers.series = function(f) S.series = { me = f[2], them = f[3], round = f[4], done = f[5] == '1' } end
 handlers.result = function(f)
-  S.result = { id = f[2], status = f[3], best = f[4], won = f[5] == 'True', port = f[6] or tostring(REPLAY_PORT) }
+  S.result = { id = f[2], status = f[3], best = f[4], won = f[5] == 'True', port = f[6] or tostring(REPLAY_PORT), video = f[7] ~= '0' }
   S.lobby, S.hud, S.gate = nil, nil, nil
   visible, page = true, 'result'
   send('records')
@@ -147,6 +191,7 @@ end
 
 function script.update(dt)
   clock = clock + dt
+  flushOutbox(dt)
   poll(dt)
   if not gotHello then
     helloTimer = helloTimer + dt
@@ -178,15 +223,15 @@ end
 -- widgets (flow layout only) ----------------------------------------------------
 local function txt(s, size, color, bold)
   ui.pushDWriteFont(bold and BOLD or FONT)
-  ui.dwriteText(s, size or 16, color or C.text)
+  ui.dwriteText(s, (size or 18) + 2, color or C.text)
   ui.popDWriteFont()
 end
 local function title(s, sub)
-  txt(s, 24, C.text, true)
-  if sub then txt(sub, 14, C.dim) end
+  txt(s, 26, C.text, true)
+  if sub then txt(sub, 15, C.dim) end
   ui.offsetCursorY(10)
 end
-local function label(s) txt(s, 14, C.dim); ui.offsetCursorY(2) end
+local function label(s) txt(s, 15, C.dim); ui.offsetCursorY(2) end
 local function space(h) ui.offsetCursorY(h or 10) end
 
 local styles = {
@@ -194,6 +239,7 @@ local styles = {
   ok = { C.okBtn, rgbm(0.22, 0.55, 0.33, 1), C.text }, bad = { C.badBtn, rgbm(0.6, 0.22, 0.22, 1), C.text },
   selected = { C.accentSoft, rgbm(0.96, 0.62, 0.16, 0.26), C.accent }, ghost = { rgbm(0, 0, 0, 0), C.btnHi, C.dim },
 }
+local crispButtons = true
 -- width: number, or nil = full available width
 local function btn(id, text, width, height, style)
   local st = styles[style or 'normal']
@@ -202,7 +248,22 @@ local function btn(id, text, width, height, style)
   ui.pushStyleColor(ui.StyleColor.ButtonActive, st[2])
   ui.pushStyleColor(ui.StyleColor.Text, st[3])
   local pushed = pushVar('FrameRounding', 8)
-  local clicked = ui.button(text .. '##' .. id, vec2(width or ui.availableSpaceX(), height or 38))
+  local size = vec2(width or ui.availableSpaceX(), (height or 38) + 6)
+  local clicked
+  if crispButtons then
+    clicked = ui.button('##' .. id, size)
+    local ok = pcall(function()
+      local a, b = ui.itemRectMin(), ui.itemRectMax()
+      local fs = size.y >= 44 and 20 or 18
+      ui.pushDWriteFont(BOLD)
+      local m = ui.measureDWriteText(text, fs)
+      ui.dwriteDrawText(text, fs, vec2((a.x + b.x - m.x) / 2, (a.y + b.y - m.y) / 2), st[3])
+      ui.popDWriteFont()
+    end)
+    if not ok then crispButtons = false end
+  else
+    clicked = ui.button(text .. '##' .. id, size)
+  end
   if pushed > 0 then ui.popStyleVar() end
   ui.popStyleColor(4)
   return clicked
@@ -278,19 +339,81 @@ end
 
 local function lobbyPanel()
   if not S.lobby then return false end
-  panel('lobbyp', 190, function()
-    txt('準備中 · ' .. S.lobby.route, 20, C.accent, true)
-    txt('場次 ' .. S.lobby.id .. ' · ' .. S.lobby.laps .. ' 圈 · 飛馳起跑', 14, C.dim)
+  panel('lobbyp', 230, function()
+    txt((S.lobby.solo and '練習已開始 · ' or '準備中 · ') .. S.lobby.route, 22, C.accent, true)
+    txt('場次 ' .. S.lobby.id .. ' · ' .. S.lobby.laps .. ' 圈 · 飛馳起跑', 15, C.dim)
     space(6)
     local arrow, dist = directionTo(S.gate)
-    if arrow then txt(string.format('起點在 %s %.0f 公尺', arrow, dist), 17, C.text, true) end
-    txt('倒數結束後才可以過起點線，提早過線算搶跑', 14, C.dim)
-    space(8)
-    local c = row('lb', { { S.ready and '已準備 · 等待其他人' or '準備好了', S.ready and 'normal' or 'ok' }, { '取消', 'bad' } }, 40)
-    if c == 1 and not S.ready then send('ready'); S.ready = true end
-    if c == 2 then send('cancel'); S.lobby = nil end
+    if arrow then txt(string.format('起點在 %s %.0f 公尺', arrow, dist), 20, C.text, true) end
+    if S.lobby.solo then
+      txt('開往起點，沿正確方向過線就自動開始計時', 16, C.dim)
+      space(8)
+      if btn('lbc', '取消練習', nil, 40, 'bad') then send('cancel'); S.lobby = nil end
+    else
+      txt('雙方都按「準備好了」後倒數，倒數完才能過線，提早過線算搶跑', 16, C.dim)
+      space(8)
+      local c = row('lb', { { S.ready and '已準備 · 等待對手' or '準備好了', S.ready and 'normal' or 'ok' }, { '取消', 'bad' } }, 40)
+      if c == 1 and not S.ready then send('ready'); S.ready = true end
+      if c == 2 then send('cancel'); S.lobby = nil end
+    end
   end)
   return true
+end
+
+-- route map preview ---------------------------------------------------------------
+local mapInfo = nil
+local function loadMap()
+  if mapInfo ~= nil then return mapInfo end
+  mapInfo = false
+  pcall(function()
+    local folder = ac.getFolder(ac.FolderID.CurrentTrackLayout)
+    local ini = ac.INIConfig.load(folder .. '/data/map.ini')
+    mapInfo = {
+      image = folder .. '/map.png',
+      w = ini:get('PARAMETERS', 'WIDTH', 0), h = ini:get('PARAMETERS', 'HEIGHT', 0),
+      ox = ini:get('PARAMETERS', 'X_OFFSET', 0), oz = ini:get('PARAMETERS', 'Z_OFFSET', 0),
+      scale = ini:get('PARAMETERS', 'SCALE_FACTOR', 1),
+    }
+    if mapInfo.w <= 0 or mapInfo.h <= 0 then mapInfo = false end
+  end)
+  return mapInfo
+end
+
+local function routeMap(name, height)
+  local pts = S.routeInfo[name or '']
+  local w = ui.availableSpaceX()
+  ui.dummy(vec2(w, height))
+  local ok = pcall(function()
+    local a = ui.itemRectMin()
+    ui.drawRectFilled(a, a + vec2(w, height), C.panel, 10)
+    local map = loadMap()
+    local toScreen
+    if map then
+      local k = math.min(w / map.w, height / map.h)
+      local dw, dh = map.w * k, map.h * k
+      local o = a + vec2((w - dw) / 2, (height - dh) / 2)
+      ui.drawImage(map.image, o, o + vec2(dw, dh), rgbm(1, 1, 1, 0.85))
+      toScreen = function(p) return o + vec2((p.x + map.ox) / map.scale * k, (p.y + map.oz) / map.scale * k) end
+    elseif pts and #pts > 1 then
+      local minx, miny, maxx, maxy = math.huge, math.huge, -math.huge, -math.huge
+      for _, p in ipairs(pts) do minx, miny, maxx, maxy = math.min(minx, p.x), math.min(miny, p.y), math.max(maxx, p.x), math.max(maxy, p.y) end
+      local k = math.min((w - 40) / math.max(1, maxx - minx), (height - 40) / math.max(1, maxy - miny))
+      toScreen = function(p) return a + vec2(20 + (p.x - minx) * k, 20 + (p.y - miny) * k) end
+    end
+    if not toScreen then return end
+    if pts and #pts > 1 then
+      for i = 2, #pts do ui.drawLine(toScreen(pts[i - 1]), toScreen(pts[i]), C.accent, 3) end
+      ui.drawCircleFilled(toScreen(pts[1]), 7, C.ok, 16)
+      ui.drawCircleFilled(toScreen(pts[#pts]), 7, C.bad, 16)
+      for i = 2, #pts - 1 do ui.drawCircleFilled(toScreen(pts[i]), 4, C.text, 12) end
+    end
+    local car = ac.getCar(0)
+    if car then ui.drawCircleFilled(toScreen(vec2(car.position.x, car.position.z)), 5, rgbm(0.4, 0.8, 1, 1), 12) end
+  end)
+  if not ok then ui.offsetCursorY(0) end
+  space(4)
+  txt('● 起點   ● 終點   ● 你的位置', 14, C.dim)
+  space(8)
 end
 
 -- pages -----------------------------------------------------------------------
@@ -300,7 +423,8 @@ pages.practice = function()
   title('練習', '單人計時 · 過起點自動開始，過終點自動結算')
   if lobbyPanel() then return end
   if routePicker('p') then
-    if btn('startp', '③ 開始練習', nil, 46, 'primary') then send('practice', S.route, S.laps) end
+    routeMap(S.route, 220)
+    if btn('startp', '③ 開始練習（自動傳送到起點）', nil, 48, 'primary') then send('practice', S.route, S.laps) end
   end
 end
 
@@ -349,7 +473,8 @@ pages.duel = function()
     end
     return
   end
-  label('③ 選擇對手')
+  routeMap(S.route, 180)
+  label('③ 選擇對手（對方接受後雙方會被傳送到起點）')
   if btn('refresh', '重新整理名單', nil, 30, 'ghost') then send('roster') end
   if #S.roster == 0 then txt('目前沒有其他車手在線', 15, C.dim) end
   for _, p in ipairs(S.roster) do
@@ -385,7 +510,7 @@ pages.result = function()
     end)
   end
   local third = S.stats and tonumber(S.stats.third or 0) > 0
-  local c = row('ra', { { '看回放', 'primary' }, { third and '要求重跑' or '再跑 / 再戰', 'normal' }, { '上傳我的畫面', 'normal' } }, 42)
+  local c = row('ra', { { r.video and '看回放' or '看結果頁', 'primary' }, { third and '要求重跑' or '再跑 / 再戰', 'normal' }, { '上傳我的畫面', 'normal' } }, 42)
   if c == 1 then os.openURL(string.format('http://%s:%s/%s/index.html', ac.getServerIP(), r.port, r.id)) end
   if c == 2 then send(third and 'rerun' or 'rematch') end
   if c == 3 then os.openURL(string.format('http://%s:%d/upload/%s?name=%s', ac.getServerIP(), MAILBOX_PORT, r.id,
@@ -468,6 +593,7 @@ end
 
 pages.route = function()
   title('路線設定', '所有車手都能建立路線 · 被鎖定的路線只有管理員能改')
+  if S.routeInfo[S.routeName] then routeMap(S.routeName, 200) end
   label('路線名稱（輸入新名稱就是新增，輸入現有名稱就是更新）')
   ui.setNextItemWidth(ui.availableSpaceX())
   S.routeName = ui.inputText('##rname', S.routeName)
@@ -525,6 +651,54 @@ local nav = {
   { 'practice', '練習' }, { 'duel', '對戰' }, { 'result', '本場結果' }, { 'records', '我的紀錄' },
   { 'board', '排行榜' }, { 'weekly', '每週挑戰' }, { 'route', '路線設定' },
 }
+
+-- 3D markers in the world ----------------------------------------------------------
+local groundCache = {}
+local function groundY(p)
+  local key = string.format('%.1f,%.1f', p.x, p.y)
+  local y = groundCache[key]
+  if y ~= nil then return y end
+  y = false
+  pcall(function()
+    local car = ac.getCar(0)
+    local top = car.position.y + 400
+    local hit = physics.raycastTrack(vec3(p.x, top, p.y), vec3(0, -1, 0), 1200)
+    if hit and hit > 0 then y = top - hit end
+  end)
+  if y then groundCache[key] = y end
+  return y or ac.getCar(0).position.y
+end
+
+local markerColors = { s = rgbm(0.2, 1, 0.4, 1), c = rgbm(1, 1, 1, 0.9), f = rgbm(1, 0.3, 0.25, 1) }
+function script.draw3D()
+  local name = (S.lobby and S.lobby.route) or (S.hud and S.lastRoute) or S.route
+  local gates = S.gates and S.gates[name]
+  if not gates then return end
+  local car = ac.getCar(0)
+  pcall(function()
+    for _, g in ipairs(gates) do
+      local mid = vec2((g.a.x + g.b.x) / 2, (g.a.y + g.b.y) / 2)
+      local dx, dz = mid.x - car.position.x, mid.y - car.position.z
+      if dx * dx + dz * dz < 1500 * 1500 then
+        local color = markerColors[g.kind] or markerColors.c
+        local ya, yb = groundY(g.a), groundY(g.b)
+        local a0, b0 = vec3(g.a.x, ya + 0.15, g.a.y), vec3(g.b.x, yb + 0.15, g.b.y)
+        local a1, b1 = vec3(g.a.x, ya + 6, g.a.y), vec3(g.b.x, yb + 6, g.b.y)
+        render.debugLine(a0, a1, color)
+        render.debugLine(b0, b1, color)
+        render.debugLine(a1, b1, color)
+        for i = 0, 4 do
+          local t = i * 0.05
+          render.debugLine(vec3(a0.x, a0.y + t, a0.z), vec3(b0.x, b0.y + t, b0.z), color)
+        end
+        if render.debugText then
+          local label = g.kind == 's' and '起點 START' or (g.kind == 'f' and '終點 FINISH' or '檢查點')
+          pcall(render.debugText, vec3(mid.x, math.max(ya, yb) + 7, mid.y), label, color, 2)
+        end
+      end
+    end
+  end)
+end
 
 -- windows ---------------------------------------------------------------------
 local noticeLeft, lastDraw = 10, nil
@@ -589,13 +763,14 @@ function script.drawUI()
     end)
   end
 
-  if S.lobby and not visible then
+  if S.lobby then
     local arrow, dist = directionTo(S.gate)
     if arrow then
-      ui.toolWindow('ACR_TOSTART', vec2(screen.x / 2 - 150, 16), vec2(300, 44), true, false, function()
-        ui.drawRectFilled(vec2(0, 0), vec2(300, 44), C.bg, 10)
-        ui.setCursor(vec2(16, 10))
-        txt(string.format('起點 %s %.0f m', arrow, dist), 18, C.accent, true)
+      ui.toolWindow('ACR_TOSTART', vec2(screen.x / 2 - 200, 16), vec2(400, 64), true, false, function()
+        ui.drawRectFilled(vec2(0, 0), vec2(400, 64), C.bg, 12)
+        ui.drawRectFilled(vec2(0, 0), vec2(400, 3), C.accent)
+        ui.setCursor(vec2(18, 12))
+        txt(string.format('前往起點  %s  %.0f m', arrow, dist), 22, C.accent, true)
       end)
     end
   end
