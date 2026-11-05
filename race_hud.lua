@@ -1,7 +1,7 @@
--- 玉長賽事 v12 · CSP online script (Ctrl+M)
+-- 玉長賽事 v13 · CSP online script (Ctrl+M)
 -- Layout rule: everything flows top-to-bottom (no absolute positioning), so nothing can overlap.
 -- Requests: hidden "ACR|" chat lines. Replies: server HTTP mailbox (port 8766) + chat fallback.
-local MENU_VERSION = '12'
+local MENU_VERSION = '13'
 local REPLAY_PORT, MAILBOX_PORT = 8765, 8766
 local W, H, NAV_W = 780, 720, 176
 
@@ -9,7 +9,7 @@ local W, H, NAV_W = 780, 720, 176
 local visible, page = false, 'go'
 local gotHello, clock = false, 0
 local P = nil   -- pedal statistics of the current run
-local sub = { go = 'practice', results = 'last', board = 'board' }
+local sub = { go = 'practice', results = 'last', board = 'board', admin = 'overview' }
 local S = {
   routes = {}, route = nil, laps = 1, admin = false, roster = {}, invite = nil, locked = {},
   lobby = nil, ready = false, hud = nil, result = nil, stats = nil, series = nil, go = nil, gate = nil,
@@ -37,7 +37,7 @@ end
 
 -- movable windows: drag any window (menu: drag the title on the left); positions are remembered
 local WPOS, LASTPOS, store = {}, {}, nil
-pcall(function() store = ac.storage({ winpos = '' }) end)
+pcall(function() store = ac.storage({ winpos = '', tpGuard = '', kn5Guard = '', autoTp = '1', tpFlip = '' }) end)
 pcall(function()
   for id, x, y in tostring(store and store.winpos or ''):gmatch('([%w_]+)=(-?[%d%.]+),(-?[%d%.]+)') do WPOS[id] = vec2(tonumber(x), tonumber(y)) end
 end)
@@ -52,6 +52,40 @@ local function winPos(id, default, screen)
   LASTPOS[id] = p
   return p
 end
+-- crash guards: if the game died while teleporting / loading a ghost model, do not try again automatically
+local noTp, noModel = false, false
+pcall(function()
+  if store.tpGuard == '1' then noTp = true; store.tpGuard = '' end
+  if store.kn5Guard == '1' then noModel = true; store.kn5Guard = '' end
+end)
+local function storeGet(k, d) local v = d; pcall(function() v = store[k] end); return v end
+local function storeSet(k, v) pcall(function() store[k] = v end) end
+
+local function rayGround(x, z, fromY)
+  local y = nil
+  pcall(function()
+    local top = fromY + 300
+    local hit = physics.raycastTrack(vec3(x, top, z), vec3(0, -1, 0), 900)
+    if hit and hit > 0 then y = top - hit end
+  end)
+  return y
+end
+
+-- move my car to the start spot the server gave me (2-wide grid, never on top of another car)
+local function teleportToStart(spot, dir)
+  if not spot or not dir then return false, '沒有起點資料' end
+  if noTp then return false, '上次傳送時遊戲異常，已停用自動傳送（可手動按「傳送到起點」）' end
+  local car = ac.getCar(0)
+  local y = rayGround(spot.x, spot.y, car.position.y) or car.position.y
+  local d = vec2(dir.x, dir.y)
+  if storeGet('tpFlip', '') == '1' then d = vec2(-d.x, -d.y) end
+  storeSet('tpGuard', '1')
+  local ok, err = pcall(function() physics.setCarPosition(0, vec3(spot.x, y + 0.5, spot.y), vec3(d.x, 0, d.y)) end)
+  S.tpClearAt = 2
+  if not ok then storeSet('tpGuard', ''); return false, '這台伺服器不允許腳本傳送：' .. tostring(err) end
+  return true
+end
+
 local dragging = nil
 local function dragHandle(id, size, at)
   ui.setCursor(at or vec2(0, 0))
@@ -210,6 +244,8 @@ handlers.invited = function(f)
 end
 handlers.lobby = function(f)
   P = nil
+  S.spot = f[9] and vec2(tonumber(f[9]), tonumber(f[10])) or nil
+  S.tpPending = storeGet('autoTp', '1') ~= '0'
   S.ghost, S.segments, S.runStart, S.ghostDelta = nil, nil, nil, nil
   S.newPB, S.chase, S.brakes = nil, nil, nil
   S.lastLaps = tonumber(f[4]) or 1
@@ -308,7 +344,7 @@ handlers.ghost = function(f)
     local v = split(p, ',')
     if #v == 3 then pts[#pts + 1] = { t = tonumber(v[1]), x = tonumber(v[2]), z = tonumber(v[3]) } end
   end
-  if #pts > 1 then S.ghost = { route = f[2], label = f[3], time = f[4], pts = pts, idx = 1 } else S.ghost = nil end
+  if #pts > 1 then S.ghost = { route = f[2], label = f[3], time = f[4], pts = pts, idx = 1, car = f[6] } else S.ghost = nil end
 end
 handlers.segments = function(f)
   local mine, ref = {}, {}
@@ -347,6 +383,17 @@ handlers.event = function(f)
               at = clock, board = {} }
   for _, row in ipairs(split(f[6], ';')) do S.event.board[#S.event.board + 1] = split(row, ':') end
 end
+handlers.astat = function(f)
+  S.astat = { online = f[2], racing = f[3], today = f[4], total = f[5], event = f[6], weekly = f[7], admins = f[8], ver = f[9] }
+end
+local function tildeRows(s)
+  local out = {}
+  for _, row in ipairs(split(s, ';')) do out[#out + 1] = split(row, '~') end
+  return out
+end
+handlers.aplayers = function(f) S.aplayers = tildeRows(f[2]) end
+handlers.araces = function(f) S.araces = tildeRows(f[2]) end
+handlers.aroutes = function(f) S.aroutes = tildeRows(f[2]) end
 handlers.ok = function(f) flash('✓ ' .. (f[2] or ''), C.ok) end
 handlers.error = function(f) flash('✕ ' .. (f[2] or ''), C.bad) end
 handlers.declined = function(f) flash((f[2] or '') .. ' 拒絕了邀請', C.bad) end
@@ -456,6 +503,12 @@ function script.update(dt)
   end
   restartHeld = ctrl and r
   if S.rerunAt and clock >= S.rerunAt then S.rerunAt = nil; send('restart') end
+  if S.tpClearAt then S.tpClearAt = S.tpClearAt - 1; if S.tpClearAt <= 0 then S.tpClearAt = nil; storeSet('tpGuard', '') end end
+  if S.tpPending and S.lobby and not S.hud then
+    S.tpPending = false
+    local ok, why = teleportToStart(S.spot, S.gateDir)
+    if not ok then flash(why, C.bad) end
+  end
   local car = ac.getCar(0)
   if S.hud then pedalSample(dt, car); updateGhostDelta(car) end
   if S.hud or S.lobby then
@@ -593,7 +646,7 @@ end
 
 local function lobbyPanel()
   if not S.lobby then return false end
-  panel('lobbyp', 230, function()
+  panel('lobbyp', 270, function()
     txt((S.lobby.solo and '練習已開始 · ' or '準備中 · ') .. S.lobby.route, 22, C.accent, true)
     txt('場次 ' .. S.lobby.id .. ' · ' .. S.lobby.laps .. ' 圈 · 飛馳起跑', 15, C.dim)
     space(6)
@@ -601,7 +654,12 @@ local function lobbyPanel()
     if arrow then txt(string.format('起點在 %s %.0f 公尺', arrow, dist), 20, C.text, true) end
     if S.lobby.solo then
       txt('開往起點，沿正確方向過線就自動開始計時', 16, C.dim)
-      txt('想直接過去：用傳送插件選「賽事起點 → ' .. S.lobby.route .. '」（伺服器重開後才會出現新路線）', 14, C.dim)
+      space(4)
+      local tc = row('tpr', { { '⤴ 傳送到起點', 'primary' }, { '方向反了', 'normal' },
+        { storeGet('autoTp', '1') ~= '0' and '自動傳送：開' or '自動傳送：關', 'normal' } }, 34)
+      if tc == 1 then noTp = false; local ok, why = teleportToStart(S.spot, S.gateDir); if not ok then flash(why, C.bad) end end
+      if tc == 2 then storeSet('tpFlip', storeGet('tpFlip', '') == '1' and '' or '1'); noTp = false; teleportToStart(S.spot, S.gateDir) end
+      if tc == 3 then storeSet('autoTp', storeGet('autoTp', '1') ~= '0' and '0' or '1') end
       space(8)
       if btn('lbc', '取消練習', nil, 40, 'bad') then send('cancel'); S.lobby = nil end
     else
@@ -971,6 +1029,11 @@ local function boardList(list, routeName)
     detail[#detail + 1] = (r[4] and r[4] ~= '') and (r[4] .. ' 級') or '未分級'
     if routeName then detail[#detail + 1] = '📍 ' .. routeName end
     txt('      ' .. table.concat(detail, '  ·  '), 13, C.dim)
+    if r[5] and r[5]:match('^AC%-') then
+      if btn('rp' .. (routeName or '') .. i, '▶ 看這筆回放', 150, 26, 'ghost') then
+        os.openURL(string.format('http://%s:%d/%s/index.html', ac.getServerIP(), REPLAY_PORT, r[5]))
+      end
+    end
     space(5)
   end
 end
@@ -1072,42 +1135,112 @@ end
 
 pages.admin = function()
   title('管理員', '僅管理員名單內的 Steam ID 可用')
-  panel('adm1', 220, function()
-    for _, k in ipairs({ { 'invite_seconds', '邀請時限（秒）' }, { 'countdown_seconds', '起跑倒數（秒）' },
-      { 'limit_seconds', '完賽時限（秒）' }, { 'time', '時間 HH:MM（重啟後生效）' } }) do
-      listRow(k[2], function()
-        ui.setNextItemWidth(ui.availableSpaceX() - 76)
-        A[k[1]] = ui.inputText('##' .. k[1], A[k[1]])
-        ui.sameLine(0, 6)
-        if btn('ap' .. k[1], '套用', 70, 26) then send('set', k[1], A[k[1]]) end
-      end)
+  local s = subTabs('adm', 'admin', { { 'overview', '總覽' }, { 'routes', '路線' }, { 'players', '玩家' },
+    { 'races', '賽事' }, { 'cars', '車輛' }, { 'server', '伺服器' } }) or sub.admin
+  if not S.astatAsked or clock - S.astatAsked > 5 then S.astatAsked = clock; send('set', 'status') end
+  local st = S.astat
+  if s == 'overview' then
+    panel('ao', 250, function()
+      if not st then txt('載入中…', 15, C.dim); return end
+      listRow('在線玩家', st.online .. ' 人')
+      listRow('進行中的比賽', st.racing .. ' 場')
+      listRow('今天跑了', st.today .. ' 場')
+      listRow('累計紀錄', st.total .. ' 場')
+      listRow('計時賽', st.event ~= '-' and st.event or '沒有')
+      listRow('每週挑戰', st.weekly ~= '-' and st.weekly or '沒有')
+      listRow('管理員 / 選單版本', st.admins .. ' 人 / v' .. st.ver)
+    end)
+    label('📢 全服公告')
+    A.announce = A.announce or ''
+    ui.setNextItemWidth(ui.availableSpaceX() - 90)
+    A.announce = ui.inputText('##announce', A.announce)
+    ui.sameLine(0, 6)
+    if btn('annc', '廣播', 80, 26, 'primary') and A.announce ~= '' then send('set', 'announce', (A.announce:gsub('|', ' '))); A.announce = '' end
+    space(8)
+    if btn('endall', '⛔ 取消所有進行中的比賽', nil, 34, 'bad') then
+      if S.confirmEndAll and clock - S.confirmEndAll < 5 then send('set', 'endall'); S.confirmEndAll = nil
+      else S.confirmEndAll = clock; flash('再按一次確認取消全部比賽（5 秒內）', C.bad) end
+    end
+  elseif s == 'routes' then
+    label('每條路線：總場數 / 有效 / 最快 · 點選後可操作')
+    for i, r in ipairs(S.aroutes or {}) do
+      local name = r[1]
+      local line = string.format('%s%s　%s 場 / 有效 %s　最快 %s', r[5] == '1' and '🔒 ' or '', name, r[2] or '0', r[3] or '0',
+        (r[4] and r[4] ~= '') and r[4] or '—')
+      if btn('ar' .. i, line, nil, 32, S.adminRoute == name and 'selected' or 'normal') then S.adminRoute = name; A.rename = name end
       space(3)
     end
-  end)
-  label('目前選擇的路線：' .. (S.route or '（無）'))
-  local c = row('rt', { { '鎖定', 'normal' }, { '解鎖', 'normal' }, { '設為本週挑戰', 'primary' } }, 34)
-  if c and S.route then send('set', ({ 'lock', 'unlock', 'weekly' })[c], S.route) end
-  space(8)
-  label('計時賽：用目前路線開一場（分鐘 / 每人次數）')
-  A.evMin, A.evTry = A.evMin or '60', A.evTry or '3'
-  ui.setNextItemWidth(90); A.evMin = ui.inputText('分鐘##evm', A.evMin); ui.sameLine(0, 10)
-  ui.setNextItemWidth(90); A.evTry = ui.inputText('次數##evt', A.evTry)
-  local c3 = row('evr', { { '開始計時賽', 'primary' }, { '結束計時賽', 'bad' } }, 32)
-  if c3 == 1 and S.route then send('set', 'event', S.route, A.evMin, A.evTry) end
-  if c3 == 2 then send('set', 'event', 'stop') end
-  space(8)
-  label('裁判：賽事編號')
-  if A.raceId == '' and S.result then A.raceId = S.result.id end
-  ui.setNextItemWidth(ui.availableSpaceX())
-  A.raceId = ui.inputText('##raceid', A.raceId)
-  local c2 = row('jd', { { '判無效', 'bad' }, { '恢復有效', 'normal' } }, 32)
-  if c2 then send('set', c2 == 1 and 'invalidate' or 'restore', A.raceId) end
-  space(8)
-  if btn('cls_open', (S.showClasses and '▾ ' or '▸ ') .. '車輛分級（排行榜用 1 級、2 級…）', nil, 32, 'ghost') then
-    S.showClasses = not S.showClasses
-    if S.showClasses then send('carlist') end
-  end
-  if S.showClasses then
+    if not S.aroutes then txt('載入中…', 14, C.dim) end
+    local name = S.adminRoute
+    if name then
+      space(6)
+      panel('arp', 210, function()
+        txt('路線：' .. name, 18, C.accent, true)
+        local c = row('art', { { '鎖定', 'normal' }, { '解鎖', 'normal' }, { '設為本週挑戰', 'primary' } }, 32)
+        if c then send('set', ({ 'lock', 'unlock', 'weekly' })[c], name) end
+        space(4)
+        ui.setNextItemWidth(ui.availableSpaceX() - 96)
+        A.rename = ui.inputText('##rename', A.rename or name)
+        ui.sameLine(0, 6)
+        if btn('arn', '改名', 90, 26) and A.rename ~= '' and A.rename ~= name then send('set', 'renameroute', name, A.rename); S.adminRoute = nil end
+        space(6)
+        if btn('ardel', '🗑 刪除這條路線（舊成績保留）', nil, 34, 'bad') then
+          if S.confirmDel == name and clock - (S.confirmDelAt or 0) < 5 then send('set', 'delroute', name); S.confirmDel = nil; S.adminRoute = nil
+          else S.confirmDel, S.confirmDelAt = name, clock; flash('再按一次確認刪除 ' .. name .. '（5 秒內）', C.bad) end
+        end
+      end)
+    end
+  elseif s == 'players' then
+    if not S.aplayers then txt('載入中…', 14, C.dim) end
+    for i, p in ipairs(S.aplayers or {}) do
+      panel('ap' .. i, 96, function()
+        txt(string.format('%s%s　#%s', p[4] == '1' and '⭐ ' or '', p[2] or '?', p[1] or '?'), 17, C.text, true)
+        txt(string.format('%s · 選單 v%s · %s', p[3] == 'racing' and '比賽中' or '空閒', p[5] or '?', p[6] or ''), 13, C.dim)
+        local c = row('apb' .. i, { { '取消他的比賽', 'normal' }, { p[4] == '1' and '移除管理員' or '設為管理員', 'normal' }, { '踢出', 'bad' } }, 28)
+        if c == 1 then send('set', 'endrace', p[1]) end
+        if c == 2 then send('set', p[4] == '1' and 'admin_del' or 'admin_add', p[1]) end
+        if c == 3 then
+          if S.confirmKick == p[1] and clock - (S.confirmKickAt or 0) < 5 then send('set', 'kick', p[1]); S.confirmKick = nil
+          else S.confirmKick, S.confirmKickAt = p[1], clock; flash('再按一次確認踢出 ' .. (p[2] or ''), C.bad) end
+        end
+      end)
+    end
+  elseif s == 'races' then
+    label('進行中的比賽')
+    if not S.araces or #S.araces == 0 then txt('目前沒有比賽', 14, C.dim) end
+    for _, r in ipairs(S.araces or {}) do listRow((r[2] or '') .. '　' .. (r[3] or ''), r[1] or '', C.dim) end
+    space(8)
+    label('計時賽：用目前路線開一場（分鐘 / 每人次數）· 路線：' .. (S.route or '（無）'))
+    A.evMin, A.evTry = A.evMin or '60', A.evTry or '3'
+    ui.setNextItemWidth(90); A.evMin = ui.inputText('分鐘##evm', A.evMin); ui.sameLine(0, 10)
+    ui.setNextItemWidth(90); A.evTry = ui.inputText('次數##evt', A.evTry)
+    local c3 = row('evr', { { '開始計時賽', 'primary' }, { '結束計時賽', 'bad' } }, 32)
+    if c3 == 1 and S.route then send('set', 'event', S.route, A.evMin, A.evTry) end
+    if c3 == 2 then send('set', 'event', 'stop') end
+    space(8)
+    label('裁判：賽事編號')
+    if A.raceId == '' and S.result then A.raceId = S.result.id end
+    ui.setNextItemWidth(ui.availableSpaceX())
+    A.raceId = ui.inputText('##raceid', A.raceId)
+    local c2 = row('jd', { { '判無效', 'bad' }, { '恢復有效', 'normal' }, { '開啟回放', 'normal' } }, 32)
+    if c2 == 1 or c2 == 2 then send('set', c2 == 1 and 'invalidate' or 'restore', A.raceId) end
+    if c2 == 3 and A.raceId ~= '' then os.openURL(string.format('http://%s:%d/%s/index.html', ac.getServerIP(), REPLAY_PORT, A.raceId)) end
+    space(8)
+    panel('adm1', 200, function()
+      for _, k in ipairs({ { 'invite_seconds', '邀請時限（秒）' }, { 'countdown_seconds', '起跑倒數（秒）' },
+        { 'limit_seconds', '完賽時限（秒）' }, { 'time', '時間 HH:MM（重啟後生效）' } }) do
+        listRow(k[2], function()
+          ui.setNextItemWidth(ui.availableSpaceX() - 76)
+          A[k[1]] = ui.inputText('##' .. k[1], A[k[1]])
+          ui.sameLine(0, 6)
+          if btn('ap' .. k[1], '套用', 70, 26) then send('set', k[1], A[k[1]]) end
+        end)
+        space(3)
+      end
+    end)
+  elseif s == 'cars' then
+    if not S.carList and not S.carAsked then S.carAsked = true; send('carlist') end
+    label('車輛分級（排行榜用 1 級、2 級…）')
     if not S.carList then txt('載入中…', 14, C.dim)
     elseif #S.carList == 0 then txt('還沒有任何車跑過', 14, C.dim) end
     for i, car in ipairs(S.carList or {}) do
@@ -1118,14 +1251,15 @@ pages.admin = function()
       if c then send('set', 'carclass', car.id, c == 1 and '-' or tostring(c - 1)) end
       space(5)
     end
-  end
-  space(8)
-  label('伺服器')
-  local c4 = row('srv', { { '查看玩家選單版本', 'normal' }, { '重開伺服器', 'bad' } }, 34)
-  if c4 == 1 then send('set', 'versions') end
-  if c4 == 2 then
-    if S.confirmRestart and clock - S.confirmRestart < 5 then send('set', 'restart_server'); S.confirmRestart = nil
-    else S.confirmRestart = clock; flash('再按一次「重開伺服器」確認（5 秒內）', C.bad) end
+  else
+    local c4 = row('srv', { { '查看玩家選單版本', 'normal' }, { '重開伺服器', 'bad' } }, 34)
+    if c4 == 1 then send('set', 'versions') end
+    if c4 == 2 then
+      if S.confirmRestart and clock - S.confirmRestart < 5 then send('set', 'restart_server'); S.confirmRestart = nil
+      else S.confirmRestart = clock; flash('再按一次「重開伺服器」確認（5 秒內）', C.bad) end
+    end
+    space(8)
+    txt('重開會讓所有人斷線約 30 秒；新的選單要重新進場才會載入。', 14, C.dim)
   end
 end
 
@@ -1164,10 +1298,58 @@ local function bar(p, q, width, color, up)
   end
 end
 
+-- ghost as a real car model (the ghost driver's car if you have it installed, else your own), no collisions
+local ghostNode, ghostFor = nil, nil
+local function carKn5(id)
+  local dir = ac.getFolder(ac.FolderID.ContentCars) .. '/' .. id
+  local pick, lod = nil, nil
+  io.scanDir(dir, '*.kn5', function(name)
+    local l = name:lower()
+    if l:find('lod_b') or l:find('lod_c') then lod = lod or name
+    elseif not l:find('lod') and not l:find('collider') and not pick then pick = name end
+  end)
+  local f = lod or pick
+  return f and (dir .. '/' .. f) or nil
+end
+local function ghostModel()
+  if noModel or not S.ghost then return nil end
+  local want = (S.ghost.car and S.ghost.car ~= '-' and S.ghost.car ~= '') and S.ghost.car or ac.getCarID(0)
+  if ghostFor == want then return ghostNode end
+  ghostFor = want
+  if ghostNode then pcall(function() ghostNode:dispose() end); ghostNode = nil end
+  storeSet('kn5Guard', '1')
+  local ok = pcall(function()
+    local path = carKn5(want) or carKn5(ac.getCarID(0))
+    if not path then error('no kn5') end
+    local holder = ac.findNodes('trackRoot:yes'):createNode('ACR_GHOST', true)
+    holder:loadKN5(path)
+    pcall(function() holder:setMaterialProperty('ksAlpha', 0.45) end)
+    pcall(function() holder:setTransparent(true) end)
+    pcall(function() holder:setShadows(false) end)
+    ghostNode = holder
+  end)
+  storeSet('kn5Guard', '')
+  if not ok then noModel = true; ghostNode = nil end
+  return ghostNode
+end
+
 local function drawGhost()
-  if not (S.ghost and S.hud and S.runStart) then return end
-  local p = ghostAt(clock - S.runStart)
+  local active = S.ghost and S.hud and S.runStart
+  local p = active and ghostAt(clock - S.runStart)
+  local node = active and ghostModel() or ghostNode
+  if node then pcall(function() node:setVisible(p ~= nil) end) end
   if not p then return end
+  if node then
+    local ok = pcall(function()
+      local a, b = ghostAt(clock - S.runStart - 0.4), ghostAt(clock - S.runStart + 0.4)
+      local dx, dz = (b and b.x or p.x) - (a and a.x or p.x), (b and b.z or p.z) - (a and a.z or p.z)
+      local len = math.sqrt(dx * dx + dz * dz)
+      if len > 0.05 then node:setOrientation(vec3(dx / len, 0, dz / len), vec3(0, 1, 0)) end
+      node:setPosition(vec3(p.x, groundY(vec2(p.x, p.z)), p.z))
+    end)
+    if ok then return end
+    noModel = true
+  end
   pcall(function()
     local y = groundY(vec2(p.x, p.z))
     local c = rgbm(0.7, 0.45, 1, 0.45)
