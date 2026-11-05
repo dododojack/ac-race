@@ -1,7 +1,7 @@
--- 玉長賽事 v13 · CSP online script (Ctrl+M)
+-- 玉長賽事 v14 · CSP online script (Ctrl+M)
 -- Layout rule: everything flows top-to-bottom (no absolute positioning), so nothing can overlap.
 -- Requests: hidden "ACR|" chat lines. Replies: server HTTP mailbox (port 8766) + chat fallback.
-local MENU_VERSION = '13'
+local MENU_VERSION = '14'
 local REPLAY_PORT, MAILBOX_PORT = 8765, 8766
 local W, H, NAV_W = 780, 720, 176
 
@@ -1122,11 +1122,18 @@ pages.route = function()
       else flash('這張地圖沒有起終點計時線，請用方法二', C.bad) end
     end
   end)
-  panel('manual', 110, function()
+  panel('manual', 150, function()
     txt('方法二：停在線上、車頭朝行駛方向後按下', 16, C.text, true)
     space(4)
     local c = row('man', { { '設為起點', 'normal' }, { '設為終點', 'normal' } }, 38)
-    if c then send('gate', S.routeName, ({ 'start', 'finish' })[c]); send('hello', MENU_VERSION) end
+    if c then
+      local car = ac.getCar(0)
+      send('gate', S.routeName, ({ 'start', 'finish' })[c], string.format('%.2f', car.position.x), string.format('%.2f', car.position.z),
+        string.format('%.4f', car.look.x), string.format('%.4f', car.look.z))
+      send('hello', MENU_VERSION)
+    end
+    local f = row('flip', { { '⇄ 起點方向反了', 'normal' }, { '⇄ 終點方向反了', 'normal' } }, 30)
+    if f then send('flipgate', S.routeName, f == 1 and 'start' or 'finish'); send('hello', MENU_VERSION) end
   end)
   if btn('webr', '在瀏覽器開路線頁（排行與最快回放）', nil, 32, 'ghost') then
     os.openURL(string.format('http://%s:%d/route?name=%s', ac.getServerIP(), REPLAY_PORT, S.routeName))
