@@ -7,6 +7,7 @@ local W, H, NAV_W = 780, 720, 176
 -- state -----------------------------------------------------------------------
 local visible, page = false, 'practice'
 local gotHello, clock = false, 0
+local P = nil   -- pedal statistics of the current run
 local S = {
   routes = {}, route = nil, laps = 1, admin = false, roster = {}, invite = nil, locked = {},
   lobby = nil, ready = false, hud = nil, result = nil, stats = nil, series = nil, go = nil, gate = nil,
@@ -25,7 +26,7 @@ local C = {
   ok = rgbm(0.4, 0.88, 0.55, 1), okBtn = rgbm(0.17, 0.45, 0.27, 1), bad = rgbm(1, 0.45, 0.42, 1), badBtn = rgbm(0.5, 0.18, 0.18, 1),
 }
 local FONT, BOLD = 'Microsoft JhengHei UI', 'Microsoft JhengHei UI:Weight=Bold'
-local WF_PAD = (ui.WindowFlags and WF_PAD) or 0
+local WF_PAD = (type(ui.WindowFlags) == 'table' and ui.WindowFlags.AlwaysUseWindowPadding) or 0
 local function pushVar(name, value)
   local id = ui.StyleVar and ui.StyleVar[name]
   if id then ui.pushStyleVar(id, value); return 1 end
@@ -55,6 +56,37 @@ local function split(s, sep)
 end
 
 local function flash(text, color) S.msg, S.msgColor, S.msgUntil = text, color or C.dim, clock + 5 end
+
+-- pedal statistics (measured in the game during a run) --------------------------------
+local function pedalReset() P = { t = 0, gasT = 0, gasSum = 0, fullT = 0, gasN = 0, gasOn = false,
+                                 brakeT = 0, brakeSum = 0, brakeMax = 0, brakeN = 0, brakeOn = false } end
+local function pedalSample(dt, car)
+  if not P then pedalReset() end
+  local gas, brake = car.gas or 0, car.brake or 0
+  P.t = P.t + dt
+  if gas > 0.05 then
+    P.gasT, P.gasSum = P.gasT + dt, P.gasSum + gas * dt
+    if gas > 0.95 then P.fullT = P.fullT + dt end
+    if not P.gasOn then P.gasN = P.gasN + 1 end
+  end
+  P.gasOn = gas > 0.05
+  if brake > 0.05 then
+    P.brakeT, P.brakeSum = P.brakeT + dt, P.brakeSum + brake * dt
+    P.brakeMax = math.max(P.brakeMax, brake)
+    if not P.brakeOn then P.brakeN = P.brakeN + 1 end
+  end
+  P.brakeOn = brake > 0.05
+end
+local function pedalSummary()
+  if not P or P.t <= 0 then return nil end
+  local pct = function(a, b) return b > 0 and a / b * 100 or 0 end
+  return {
+    gas_share = pct(P.gasT, P.t), gas_avg = pct(P.gasSum, P.gasT), gas_full = pct(P.fullT, P.t),
+    gas_presses = P.gasN, gas_hold = P.gasN > 0 and P.gasT / P.gasN or 0,
+    brake_share = pct(P.brakeT, P.t), brake_avg = pct(P.brakeSum, P.brakeT), brake_max = P.brakeMax * 100,
+    brake_presses = P.brakeN, brake_hold = P.brakeN > 0 and P.brakeT / P.brakeN or 0,
+  }
+end
 
 local handlers = {}
 handlers.routes = function(f)
@@ -92,24 +124,12 @@ handlers.invited = function(f)
   S.invite = { slot = f[2], name = f[3], route = f[4], expires = clock + (tonumber(f[5]) or 30) }
   visible, page = true, 'duel'
 end
-local function teleport(x, z, nx, nz)
-  local car = ac.getCar(0)
-  local ok, err = pcall(function()
-    local y = car.position.y
-    local hit = physics.raycastTrack(vec3(x, y + 400, z), vec3(0, -1, 0), 1200)
-    if hit and hit > 0 then y = y + 400 - hit + 0.6 end
-    physics.setCarPosition(0, vec3(x, y, z), vec3(nx, 0, nz))
-  end)
-  if ok then flash('已傳送到起點後方', C.ok)
-  else flash('無法自動傳送（伺服器限制），請用傳送插件或開到起點', C.dim) end
-end
-
 handlers.lobby = function(f)
+  P = nil
   S.lastRoute = f[3]
   S.lobby = { id = f[2], route = f[3], laps = f[4], solo = f[13] == '1' }
   S.gate = vec2((tonumber(f[5]) + tonumber(f[7])) / 2, (tonumber(f[6]) + tonumber(f[8])) / 2)
   S.gateDir = f[11] and vec2(tonumber(f[11]), tonumber(f[12])) or nil
-  if f[9] and tonumber(f[9]) then teleport(tonumber(f[9]), tonumber(f[10]), tonumber(f[11]), tonumber(f[12])) end
   visible = false
   S.ready, S.hud, S.stats, S.split = false, nil, nil, nil
   if page ~= 'duel' then page = 'practice' end
@@ -121,10 +141,19 @@ handlers.hud = function(f)
 end
 handlers.split = function(f) S.split = { label = f[2], time = f[3], delta = f[4], untilT = clock + 4 } end
 handlers.stats = function(f)
-  S.stats = { top = f[2], avg = f[3], moving = f[4], stops = f[5], wall = f[6], car = f[7], third = f[8], jump = f[9] == '1' }
+  S.stats = { top = f[2], avg = f[3], moving = f[4], stops = f[5], wall = f[6], car = f[7], third = f[8], jump = f[9] == '1',
+              shifts = f[10] or '0', stopped = f[11] or '0' }
 end
 handlers.series = function(f) S.series = { me = f[2], them = f[3], round = f[4], done = f[5] == '1' } end
 handlers.result = function(f)
+  local ped = pedalSummary()
+  S.pedals = ped
+  if ped and f[2] then
+    send('pedals', f[2], string.format('%.1f', ped.gas_share), string.format('%.1f', ped.gas_avg), string.format('%.1f', ped.gas_full),
+      ped.gas_presses, string.format('%.2f', ped.gas_hold), string.format('%.1f', ped.brake_share), string.format('%.1f', ped.brake_avg),
+      string.format('%.1f', ped.brake_max), ped.brake_presses, string.format('%.2f', ped.brake_hold))
+  end
+  P = nil
   S.result = { id = f[2], status = f[3], best = f[4], won = f[5] == 'True', port = f[6] or tostring(REPLAY_PORT), video = f[7] ~= '0' }
   S.lobby, S.hud, S.gate = nil, nil, nil
   visible, page = true, 'result'
@@ -163,7 +192,7 @@ local function handle(message)
   local at = message:find('ACR|', 1, true)
   if not at then return false end
   local f = split(message:sub(at + 4), '|')
-  gotHello = true
+  if f[1] == 'routes' then gotHello = true end
   local h = handlers[f[1]]
   if h then pcall(h, f) end
   return true
@@ -200,10 +229,14 @@ function script.update(dt)
   local ctrl, m = ac.isKeyDown(ac.KeyIndex.Control), ac.isKeyDown(ac.KeyIndex.M)
   if ctrl and m and not comboHeld then
     visible = not visible
-    if visible then send('roster'); send('records'); send('lobbies') end
+    if visible then
+      if #S.routes == 0 then send('hello') end
+      send('roster'); send('records'); send('lobbies')
+    end
   end
   comboHeld = ctrl and m
   local car = ac.getCar(0)
+  if S.hud then pedalSample(dt, car) end
   if S.hud or S.lobby then
     speedTimer = speedTimer + dt
     if speedTimer >= 2 then speedTimer = 0; send('spd', string.format('%.1f', car.speedKmh)) end
@@ -347,6 +380,7 @@ local function lobbyPanel()
     if arrow then txt(string.format('起點在 %s %.0f 公尺', arrow, dist), 20, C.text, true) end
     if S.lobby.solo then
       txt('開往起點，沿正確方向過線就自動開始計時', 16, C.dim)
+      txt('想直接過去：用傳送插件選「賽事起點 → ' .. S.lobby.route .. '」（伺服器重開後才會出現新路線）', 14, C.dim)
       space(8)
       if btn('lbc', '取消練習', nil, 40, 'bad') then send('cancel'); S.lobby = nil end
     else
@@ -412,7 +446,7 @@ local function routeMap(name, height)
   end)
   if not ok then ui.offsetCursorY(0) end
   space(4)
-  txt('● 起點   ● 終點   ● 你的位置', 14, C.dim)
+  txt('綠＝起點　紅＝終點　藍＝你的位置', 14, C.dim)
   space(8)
 end
 
@@ -501,12 +535,23 @@ pages.result = function()
     txt(r.best ~= '-' and (r.best .. ' 秒') or '—', 34, C.accent, true)
   end)
   if S.stats then
-    panel('st', 190, function()
+    panel('st', 240, function()
       listRow('最高速', S.stats.top .. ' km/h')
       listRow('行駛均速（3 km/h 以上）', S.stats.moving .. ' km/h')
       listRow('全程均速（含停車）', S.stats.avg .. ' km/h')
-      listRow('停車次數', S.stats.stops)
+      listRow('停車（低於 3 km/h 連續 3 秒）', S.stats.stops .. ' 次 / ' .. S.stats.stopped .. ' 秒')
+      listRow('換檔次數', S.stats.shifts)
       listRow('撞牆 / 撞車 / 第三方', S.stats.wall .. ' / ' .. S.stats.car .. ' / ' .. S.stats.third)
+    end)
+  end
+  local pd = S.pedals
+  if pd then
+    panel('pd', 200, function()
+      listRow('踩油門時間 / 全油門', string.format('%.0f%% / %.0f%%', pd.gas_share, pd.gas_full))
+      listRow('平均油門力度', string.format('%.0f%%', pd.gas_avg))
+      listRow('每次油門平均', string.format('%.1f 秒（%d 次）', pd.gas_hold, pd.gas_presses))
+      listRow('踩煞車時間 / 平均力度', string.format('%.0f%% / %.0f%%', pd.brake_share, pd.brake_avg))
+      listRow('最大煞車 / 次數', string.format('%.0f%% / %d 次（平均 %.1f 秒）', pd.brake_max, pd.brake_presses, pd.brake_hold))
     end)
   end
   local third = S.stats and tonumber(S.stats.third or 0) > 0
@@ -600,7 +645,7 @@ pages.route = function()
   space(8)
   panel('auto', 110, function()
     txt('方法一：一鍵套用', 17, C.text, true)
-    txt('使用地圖本身「開始計時／結束計時」的位置與分段', 14, C.dim)
+    txt('使用地圖本身「開始計時／結束計時」的位置', 14, C.dim)
     space(6)
     if btn('trk', '套用地圖計時線', nil, 40, 'primary') then
       local ok, parts = trackGates()
@@ -613,10 +658,10 @@ pages.route = function()
   end)
   panel('manual', 130, function()
     txt('方法二：手動設定', 17, C.text, true)
-    txt('把車停在線上、車頭朝正確行駛方向，依序按下（起點和終點都要設）', 14, C.dim)
+    txt('把車停在線上、車頭朝正確行駛方向後按下（起點和終點都要設）', 14, C.dim)
     space(6)
-    local c = row('man', { { '設為起點', 'normal' }, { '+ 檢查點', 'normal' }, { '設為終點', 'normal' } }, 38)
-    if c then send('gate', S.routeName, ({ 'start', 'checkpoint', 'finish' })[c]); send('hello') end
+    local c = row('man', { { '設為起點', 'normal' }, { '設為終點', 'normal' } }, 40)
+    if c then send('gate', S.routeName, ({ 'start', 'finish' })[c]); send('hello') end
   end)
 end
 
@@ -669,35 +714,37 @@ local function groundY(p)
   return y or ac.getCar(0).position.y
 end
 
-local markerColors = { s = rgbm(0.2, 1, 0.4, 1), c = rgbm(1, 1, 1, 0.9), f = rgbm(1, 0.3, 0.25, 1) }
+local markerColors = { s = rgbm(0.15, 0.95, 0.35, 0.85), f = rgbm(1, 0.25, 0.2, 0.85) }
 function script.draw3D()
-  local name = (S.lobby and S.lobby.route) or (S.hud and S.lastRoute) or S.route
+  if not (S.lobby or S.hud) then return end            -- only racers see the lines
+  local name = (S.lobby and S.lobby.route) or S.lastRoute
   local gates = S.gates and S.gates[name]
   if not gates then return end
   local car = ac.getCar(0)
   pcall(function()
-    for _, g in ipairs(gates) do
-      local mid = vec2((g.a.x + g.b.x) / 2, (g.a.y + g.b.y) / 2)
-      local dx, dz = mid.x - car.position.x, mid.y - car.position.z
-      if dx * dx + dz * dz < 1500 * 1500 then
-        local color = markerColors[g.kind] or markerColors.c
-        local ya, yb = groundY(g.a), groundY(g.b)
-        local a0, b0 = vec3(g.a.x, ya + 0.15, g.a.y), vec3(g.b.x, yb + 0.15, g.b.y)
-        local a1, b1 = vec3(g.a.x, ya + 6, g.a.y), vec3(g.b.x, yb + 6, g.b.y)
-        render.debugLine(a0, a1, color)
-        render.debugLine(b0, b1, color)
-        render.debugLine(a1, b1, color)
-        for i = 0, 4 do
-          local t = i * 0.05
-          render.debugLine(vec3(a0.x, a0.y + t, a0.z), vec3(b0.x, b0.y + t, b0.z), color)
-        end
-        if render.debugText then
-          local label = g.kind == 's' and '起點 START' or (g.kind == 'f' and '終點 FINISH' or '檢查點')
-          pcall(render.debugText, vec3(mid.x, math.max(ya, yb) + 7, mid.y), label, color, 2)
-        end
-      end
-    end
+    if render.setDepthMode and render.DepthMode then render.setDepthMode(render.DepthMode.ReadOnlyLessEqual or render.DepthMode.Normal) end
+    if render.setBlendMode and render.BlendMode then render.setBlendMode(render.BlendMode.AlphaBlend) end
   end)
+  for _, g in ipairs(gates) do
+    if g.kind == 's' or g.kind == 'f' then
+      pcall(function()
+        local mid = vec2((g.a.x + g.b.x) / 2, (g.a.y + g.b.y) / 2)
+        local dx, dz = mid.x - car.position.x, mid.y - car.position.z
+        if dx * dx + dz * dz > 1200 * 1200 then return end
+        local ya, yb = groundY(g.a), groundY(g.b)
+        local ux, uz = g.b.x - g.a.x, g.b.y - g.a.y
+        local len = math.sqrt(ux * ux + uz * uz)
+        if len < 0.1 then return end
+        local nx, nz = -uz / len * 0.5, ux / len * 0.5   -- strip 1 m wide, lying on the road
+        local h = 0.06
+        local p1 = vec3(g.a.x - nx, ya + h, g.a.y - nz)
+        local p2 = vec3(g.a.x + nx, ya + h, g.a.y + nz)
+        local p3 = vec3(g.b.x + nx, yb + h, g.b.y + nz)
+        local p4 = vec3(g.b.x - nx, yb + h, g.b.y - nz)
+        render.quad(p1, p2, p3, p4, markerColors[g.kind])
+      end)
+    end
+  end
 end
 
 -- windows ---------------------------------------------------------------------
