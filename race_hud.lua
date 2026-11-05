@@ -1,7 +1,7 @@
--- 玉長賽事 v10 · CSP online script (Ctrl+M)
+-- 玉長賽事 v12 · CSP online script (Ctrl+M)
 -- Layout rule: everything flows top-to-bottom (no absolute positioning), so nothing can overlap.
 -- Requests: hidden "ACR|" chat lines. Replies: server HTTP mailbox (port 8766) + chat fallback.
-local MENU_VERSION = '11'
+local MENU_VERSION = '12'
 local REPLAY_PORT, MAILBOX_PORT = 8765, 8766
 local W, H, NAV_W = 780, 720, 176
 
@@ -33,6 +33,37 @@ local function pushVar(name, value)
   local id = ui.StyleVar and ui.StyleVar[name]
   if id then ui.pushStyleVar(id, value); return 1 end
   return 0
+end
+
+-- movable windows: drag any window (menu: drag the title on the left); positions are remembered
+local WPOS, LASTPOS, store = {}, {}, nil
+pcall(function() store = ac.storage({ winpos = '' }) end)
+pcall(function()
+  for id, x, y in tostring(store and store.winpos or ''):gmatch('([%w_]+)=(-?[%d%.]+),(-?[%d%.]+)') do WPOS[id] = vec2(tonumber(x), tonumber(y)) end
+end)
+local function savePos()
+  local parts = {}
+  for id, p in pairs(WPOS) do parts[#parts + 1] = string.format('%s=%.0f,%.0f', id, p.x, p.y) end
+  pcall(function() store.winpos = table.concat(parts, ';') end)
+end
+local function winPos(id, default, screen)
+  local p = WPOS[id] or default
+  p = vec2(math.max(0, math.min(screen.x - 60, p.x)), math.max(0, math.min(screen.y - 40, p.y)))
+  LASTPOS[id] = p
+  return p
+end
+local dragging = nil
+local function dragHandle(id, size, at)
+  ui.setCursor(at or vec2(0, 0))
+  ui.invisibleButton('drag_' .. id, size)
+  if ui.itemActive and ui.itemActive() then
+    local d = ui.mouseDelta and ui.mouseDelta() or vec2(0, 0)
+    WPOS[id] = (WPOS[id] or LASTPOS[id] or vec2(0, 0)) + d
+    dragging = id
+  elseif dragging == id then
+    dragging = nil; savePos()
+  end
+  ui.setCursor(at or vec2(0, 0))
 end
 
 -- protocol ----------------------------------------------------------------------
@@ -69,7 +100,19 @@ end
 local function flash(text, color) S.msg, S.msgColor, S.msgUntil = text, color or C.dim, clock + 5 end
 
 -- pedal statistics (measured in the game during a run) --------------------------------
-local function pedalReset() P = { wallHits = 0, carHits = 0, lastHit = -9, lastSpeed = nil, t = 0, gasT = 0, gasSum = 0, fullT = 0, gasN = 0, gasOn = false,
+local function band(v) if v >= 0.95 then return 1 elseif v >= 0.75 then return 2 elseif v >= 0.5 then return 3 elseif v >= 0.25 then return 4 elseif v >= 0.05 then return 5 end return 6 end
+local function otherCarNear(car)
+  local ok, near = pcall(function()
+    local n = ac.getSim().carsCount or 1
+    for i = 1, n - 1 do
+      local o = ac.getCar(i)
+      if o and o.isConnected ~= false and (o.position - car.position):length() < 7 then return true end
+    end
+    return false
+  end)
+  return ok and near
+end
+local function pedalReset() P = { gb = { 0, 0, 0, 0, 0, 0 }, bb = { 0, 0, 0, 0, 0, 0 }, tl = {}, tlT = 0, wallHits = 0, carHits = 0, lastHit = -9, lastSpeed = nil, t = 0, gasT = 0, gasSum = 0, fullT = 0, gasN = 0, gasOn = false,
                                  brakeT = 0, brakeSum = 0, brakeMax = 0, brakeN = 0, brakeOn = false } end
 local function pedalSample(dt, car)
   if not P then pedalReset() end
@@ -78,10 +121,18 @@ local function pedalSample(dt, car)
   -- contacts: CSP collision info when available, otherwise a sudden deceleration without braking
   local speed = car.speedKmh or 0
   local hit, withCar = false, false
-  if car.collidedWith ~= nil and car.collidedWith >= 0 then hit, withCar = true, true end
+  -- another car only counts when one is actually next to us (CSP reports some wall contacts as car contacts)
+  if car.collidedWith ~= nil and car.collidedWith >= 0 and otherCarNear(car) then hit, withCar = true, true end
   if (car.collisionDepth or 0) > 0.01 then hit = true end
   if P.lastSpeed and dt > 0 and (P.lastSpeed - speed) / 3.6 / dt > 22 and brake < 0.5 then hit = true end
   P.lastSpeed = speed
+  P.gb[band(gas)] = P.gb[band(gas)] + dt
+  P.bb[band(brake)] = P.bb[band(brake)] + dt
+  P.tlT = P.tlT + dt
+  if P.tlT >= 0.1 and #P.tl < 12000 then
+    P.tlT = 0
+    P.tl[#P.tl + 1] = string.format('%.2f,%d,%d,%d,%.0f', P.t, math.floor(gas * 100 + 0.5), math.floor(brake * 100 + 0.5), car.gear or 0, speed)
+  end
   if hit then
     if P.t - P.lastHit > 1.5 then
       if withCar then P.carHits = P.carHits + 1 else P.wallHits = P.wallHits + 1 end
@@ -109,7 +160,7 @@ local function pedalSummary()
     gas_presses = P.gasN, gas_hold = P.gasN > 0 and P.gasT / P.gasN or 0,
     brake_share = pct(P.brakeT, P.t), brake_avg = pct(P.brakeSum, P.brakeT), brake_max = P.brakeMax * 100,
     brake_presses = P.brakeN, brake_hold = P.brakeN > 0 and P.brakeT / P.brakeN or 0,
-    wall_hits = P.wallHits, car_hits = P.carHits,
+    wall_hits = P.wallHits, car_hits = P.carHits, gb = P.gb, bb = P.bb, tl = P.tl,
   }
 end
 
@@ -172,7 +223,10 @@ handlers.lobby = function(f)
 end
 handlers.go = function(f) S.go = clock + (tonumber(f[2]) or 5) end
 handlers.hud = function(f)
-  S.runStart = clock - (tonumber(f[2]) or 0)
+  -- the clock runs locally every frame; server updates only correct it when it drifts
+  local t = tonumber(f[2]) or 0
+  if not S.runStart or math.abs((clock - S.runStart) - t) > 0.25 then S.runStart = clock - t end
+  S.hudAt = clock
   S.hud = { time = tonumber(f[2]) or 0, laps = tonumber(f[3]) or 0, sectors = tonumber(f[4]) or 0, gap = f[5],
             pos = f[6], of = f[7], totalLaps = f[8], cps = tonumber(f[9]) or 0 }
 end
@@ -189,6 +243,12 @@ handlers.result = function(f)
     send('pedals', f[2], string.format('%.1f', ped.gas_share), string.format('%.1f', ped.gas_avg), string.format('%.1f', ped.gas_full),
       ped.gas_presses, string.format('%.2f', ped.gas_hold), string.format('%.1f', ped.brake_share), string.format('%.1f', ped.brake_avg),
       string.format('%.1f', ped.brake_max), ped.brake_presses, string.format('%.2f', ped.brake_hold), ped.wall_hits, ped.car_hits)
+    local fmt = function(t) local o = {} for i = 1, 6 do o[i] = string.format('%.1f', t[i]) end return table.concat(o, ',') end
+    send('bands', f[2], fmt(ped.gb), fmt(ped.bb))
+    if #ped.tl > 0 then
+      local url = string.format('http://%s:%d/telemetry/%s?slot=%d', ac.getServerIP(), MAILBOX_PORT, f[2], ac.getCar(0).sessionID)
+      pcall(function() web.post(url, { ['Content-Type'] = 'text/plain' }, table.concat(ped.tl, '\n'), function() end) end)
+    end
   end
   P = nil
   S.result = { id = f[2], status = f[3], best = f[4], won = f[5] == 'True', port = f[6] or tostring(REPLAY_PORT), video = f[7] ~= '0' }
@@ -853,6 +913,13 @@ local function lastResult()
       listRow('踩煞車時間 / 平均力度', string.format('%.0f%% / %.0f%%', pd.brake_share, pd.brake_avg))
       listRow('最大煞車 / 次數', string.format('%.0f%% / %d 次', pd.brake_max, pd.brake_presses))
     end)
+    if pd.gb then
+      local names = { '全開 ≥95%', '75–95%', '50–75%', '25–50%', '5–25%', '放開' }
+      panel('bands', 46 + 6 * 28, function()
+        txt('油門 / 煞車 各力度累計秒數', 15, C.text, true)
+        for i = 1, 6 do listRow(names[i], string.format('油 %.1f 秒　煞 %.1f 秒', pd.gb[i], pd.bb[i])) end
+      end)
+    end
   end
   if sg and #sg.mine > 0 then
     panel('seg', 50 + #sg.mine * 30, function()
@@ -1189,13 +1256,16 @@ local function topPanel(screen)
   local h = S.hud
   local warn = nil
   if wrongTimer > 1.5 then warn = '⚠ 逆向行駛' end
-  ui.toolWindow('ACR_TOP', vec2(screen.x / 2 - W2 / 2, 14), vec2(W2, 150), true, false, function()
+  ui.toolWindow('ACR_TOP', winPos('top', vec2(16, screen.y * 0.16), screen), vec2(W2, 150), true, true, function()
     local H2 = 150
+    dragHandle('top', vec2(W2, H2))
     ui.drawRectFilled(vec2(0, 0), vec2(W2, H2), C.bg, 14)
     ui.drawRectFilled(vec2(0, 0), vec2(W2, 3), warn and C.bad or C.accent)
     if h then
       ui.setCursor(vec2(18, 8))
-      txt(string.format('%d:%06.3f', math.floor(h.time / 60), h.time % 60), 40, C.accent, true)
+      local tt = h.time
+      if S.runStart and S.hudAt and clock - S.hudAt < 1.5 then tt = clock - S.runStart end
+      txt(string.format('%d:%05.2f', math.floor(tt / 60), tt % 60), 40, C.accent, true)
       ui.setCursor(vec2(250, 14))
       local info = {}
       if tonumber(h.totalLaps or 1) > 1 then info[#info + 1] = string.format('第 %d/%s 圈', math.min(h.laps + 1, tonumber(h.totalLaps)), h.totalLaps) end
@@ -1246,7 +1316,8 @@ function script.drawUI()
   if not noticeStart then noticeStart = now end
   local left = noticeClosed and 0 or (10 - (now - noticeStart))
   if left > 0 then
-    ui.toolWindow('ACR_LOADED', vec2(screen.x / 2 - 210, 70), vec2(420, 52), true, true, function()
+    ui.toolWindow('ACR_LOADED', winPos('loaded', vec2(screen.x / 2 - 210, 70), screen), vec2(420, 52), true, true, function()
+      dragHandle('loaded', vec2(370, 52))
       ui.drawRectFilled(vec2(0, 0), vec2(420, 52), C.bg, 10)
       ui.drawRectFilled(vec2(0, 0), vec2(4, 52), C.accent)
       ui.setCursor(vec2(18, 13))
@@ -1264,7 +1335,8 @@ function script.drawUI()
 
   if S.go and clock < S.go then safe('go', function()
     local n = math.ceil(S.go - clock)
-    ui.toolWindow('ACR_GO', vec2(screen.x / 2 - 70, screen.y * 0.28), vec2(140, 140), true, false, function()
+    ui.toolWindow('ACR_GO', winPos('go', vec2(screen.x / 2 - 70, screen.y * 0.28), screen), vec2(140, 140), true, true, function()
+      dragHandle('go', vec2(140, 140))
       ui.drawCircleFilled(vec2(70, 70), 66, C.bg, 40)
       ui.drawCircle(vec2(70, 70), 66, C.accent, 40, 3)
       ui.setCursor(vec2(n >= 10 and 30 or 48, 26))
@@ -1273,7 +1345,8 @@ function script.drawUI()
   end) end
 
   if S.badgePopup and clock < S.badgePopup.untilT then safe('badge', function()
-    ui.toolWindow('ACR_BADGE', vec2(screen.x - 380, screen.y * 0.18), vec2(340, 76), true, false, function()
+    ui.toolWindow('ACR_BADGE', winPos('badge', vec2(screen.x - 380, screen.y * 0.18), screen), vec2(340, 76), true, true, function()
+      dragHandle('badge', vec2(340, 76))
       ui.drawRectFilled(vec2(0, 0), vec2(340, 76), C.bg, 12)
       ui.drawRectFilled(vec2(0, 0), vec2(4, 76), C.ok)
       ui.setCursor(vec2(18, 10)); txt('🏅 解鎖成就：' .. S.badgePopup.name, 18, C.ok, true)
@@ -1282,13 +1355,14 @@ function script.drawUI()
   end) end
 
   if not visible then return end
-  ui.toolWindow('ACR_MENU', vec2(60, math.max(20, screen.y / 2 - H / 2)), vec2(W, H), true, true, function()
+  ui.toolWindow('ACR_MENU', winPos('menu', vec2(60, math.max(20, screen.y / 2 - H / 2)), screen), vec2(W, H), true, true, function()
     ui.drawRectFilled(vec2(0, 0), vec2(W, H), C.bg, 14)
     ui.pushStyleColor(ui.StyleColor.ChildBg, C.nav)
     ui.childWindow('ACR_NAV', vec2(NAV_W, H), false, WF_PAD, function()
+      dragHandle('menu', vec2(NAV_W, 62))
       ui.offsetCursorY(12)
       txt('玉長賽事', 22, C.accent, true)
-      txt('v' .. MENU_VERSION, 12, C.dim)
+      txt('v' .. MENU_VERSION .. '  ⠿ 拖曳移動', 12, C.dim)
       space(14)
       local items = {}
       for _, n in ipairs(nav) do items[#items + 1] = n end
